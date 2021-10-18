@@ -55,7 +55,14 @@ impl Proxy {
             })),
         }
         // Create the listener
-        let listener = TcpListener::bind(self.addr).await?;
+        //let listener = TcpListener::bind(self.addr).await?;
+        let listener = match TcpListener::bind(self.addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                self.running.store(true, Ordering::Relaxed);
+                return Err(Box::new(e));
+            },
+        };
         info!(" Starting server on {}", self.addr);
         loop {
             let (stream, addr) = listener.accept().await?;
@@ -186,6 +193,7 @@ impl Proxy {
 pub struct Route {
     path: String,
     server_addr: String,
+    scheme: String,
     handler: Handler,
 }
 
@@ -194,6 +202,7 @@ impl Route {
         Self {
             path,
             handler,
+            scheme: "http".into(),
             server_addr: String::new(),
         }
     }
