@@ -6,16 +6,6 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[[bin]]
-name = "server"
-path = "src/server/main.rs"
-
-[[bin]]
-name = "rusty-proxy"
-path = "src/rusty-proxy/main.rs"
-
 [dependencies]
-actix-web = "3"
 log = "0.4"
-serde_json = "1"
-tokio = "1.8.2"
+tokio = { version = "1.12.0", features = ["net"] }
