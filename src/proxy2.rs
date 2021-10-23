@@ -8,10 +8,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::{
-    self,
-    net::{TcpListener, TcpStream},
-};
+use tokio::net::{TcpListener, TcpStream};
 
 const BUFFER_SIZE: usize = 1 << 12;
 
@@ -73,29 +70,45 @@ impl Proxy {
         let addr_str = addr.to_string();
         trace!("handling connection from {}", addr_str);
 
-
-        // Wait for the stream to be readable
-        match stream.readable().await {
-            Err(_) => {
-                warn!("error awaiting readable stream");
+        // Change the stream into a standard library TcpStream
+        trace!("converting tokio::TcpStream into std::TcpStream");
+        let mut std_stream = match stream.into_std() {
+            Ok(ss) => ss,
+            Err(e) => {
+                warn!("error converting stream: {}", e);
                 return;
             },
-            _ => (),
+        }
+        // Change it to blocking
+        trace!("changing stream to nonblocking");
+        match std_stream.set_nonblocking(false) {
+            Ok(_) => (),
+            Err(e) => {
+                warn!("error setting to nonblocking: {}", e);
+                return;
+            },
+        }
+        // Set the read timeout
+        trace!("setting stream read timeout to {} ms", STREAM_READ_TIMEOUT);
+        match std_stream.set_read_timeout(Some(Duration::from_millis(STREAM_READ_TIMEOUT))) {
+            Ok(_) => (),
+            Err(e) => {
+                warn!("error setting read timeout: {}", e);
+                return;
+            },
         }
         // Read from the stream
         trace!("reading from the stream");
         #[allow(unused_mut)]
         let mut buffer = [0u8; BUFFER_SIZE];
-        let mut bytes_read = match tokio::time::timeout(Duration::from_millis(STREAM_READ_TIMEOUT), async { stream.try_read(&mut buffer) }).await {
-            Ok(res) => match res {
-                Ok(size) => size,
-                Err(e) => {
-                    warn!("error reading from stream: {}", e);
-                    return;
-                },
-            },
-            Err(_) => {
+        let mut bytes_read = match std_stream.read(&mut buffer) {
+            Ok(size) => size,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
                 warn!("stream read timed out");
+                return;
+            },
+            Err(e) => {
+                warn!("error reading from stream: {}", e);
                 return;
             },
         };
@@ -103,27 +116,10 @@ impl Proxy {
         trace!("parsing data from the stream");
         #[allow(unused_variables)]
         #[allow(unused_assignments)]
-        /*
-        let (method, uri, version);
-        match parse_request(&buffer[..bytes_read]) {
-            Some((m, u, v)) => {
-                method = m;
-                uri = u;
-                version = v;
-            },
-            None => {
-                match stream.try_write(BAD_REQUEST.as_bytes()) {
-                    Ok(_) => (),
-                    Err(e) => warn!("error writing response to stream: {}", e),
-                }
-                return;
-            }
-        }
-        */
         let (method, uri, version) = match parse_request(&buffer[..bytes_read]) {
-            Some(parts) => parts,
+            Some(parts) => parts
             None => {
-                match stream.try_write(BAD_REQUEST.as_bytes()) {
+                match std_stream.write(BAD_REQUEST.as_bytes()) {
                     Ok(_) => (),
                     Err(e) => warn!("error writing response to stream: {}", e),
                 }
@@ -137,7 +133,7 @@ impl Proxy {
             Some(version) => match version {
                 (1, 0) | (1, 1) => (),
                 _ => {
-                    match stream.try_write(VERSION_NOT_SUPPORTED.as_bytes()) {
+                    match std_stream.write(VERSION_NOT_SUPPORTED.as_bytes()) {
                         Ok(_) => (),
                         Err(e) => warn!("error writing response to stream: {}", e),
                     }
@@ -145,7 +141,7 @@ impl Proxy {
                 }
             },
             None => {
-                match stream.try_write(VERSION_NOT_SUPPORTED.as_bytes()) {
+                match std_stream.write(VERSION_NOT_SUPPORTED.as_bytes()) {
                     Ok(_) => (),
                     Err(e) => warn!("error writing response to stream: {}", e),
                 }
@@ -154,27 +150,18 @@ impl Proxy {
         }
         // Get the server conn for the given path
         trace!("getting the server conn for the path {}", uri);
+        #[allow(unused_assignments)]
+        #[allow(unreachable_patterns)]
         let server_conn = match self.get_path(uri.clone()) {
-            Some(conn) => conn,
+            Some(server) => server,
             None => {
-                match stream.try_write(NOT_FOUND.as_bytes()) {
+                match std_stream.write(NOT_FOUND.as_bytes()) {
                     Ok(_) => (),
                     Err(e) => warn!("error writing response to stream: {}", e),
                 }
                 return;
             },
         };
-        // Connect to the requested server
-        let server_stream = match TcpStream::connect(server_conn.addr).await {
-            Ok(server) => server,
-            Err(e) => {
-                // Log client and server stream information
-                warn!("error connecting to server: {}", e);
-                return;
-            },
-        };
-        
-        // Read the rest from the stream
         if bytes_read == BUFFER_SIZE {
             info!("more bytes in stream");
         }
