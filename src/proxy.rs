@@ -1,16 +1,19 @@
 // TODO: Log socket (stream) info
 #![allow(dead_code)]
 use log::{info, trace, warn};
-use std::collections::HashMap;
-use std::error::Error;
-use std::fmt;
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    net::{SocketAddr, ToSocketAddrs},
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use tokio::{
     self,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::oneshot,
 };
 
 const BUFFER_SIZE: usize = 1 << 12;
@@ -18,10 +21,11 @@ const BUFFER_SIZE: usize = 1 << 12;
 // Stream read timeout in ms
 const STREAM_READ_TIMEOUT: u64 = 1000;
 
-const OK: &'static str = "HTTP/1.0 200 OK\r\n\r\n";
-const BAD_REQUEST: &'static str = "HTTP/1.0 400 Bad Request\r\n\r\n";
-const NOT_FOUND: &'static str = "HTTP/1.0 404 Not Found\r\n\r\n";
-const VERSION_NOT_SUPPORTED: &'static str = "HTTP/1.0 505 Version Not Supported\r\n\r\n";
+const OK_RESPONSE: &'static str = "HTTP/1.0 200 OK_RESPONSE\r\n\r\n";
+const BAD_REQUEST_RESPONSE: &'static str = "HTTP/1.0 400 Bad Request\r\n\r\n";
+const NOT_FOUND_RESPONSE: &'static str = "HTTP/1.0 404 Not Found\r\n\r\n";
+const INTERNAL_SERVER_ERROR_RESPONSE: &'static str = "HTTP/1.0 500 Internal Server Error\r\n\r\n";
+const VERSION_NOT_SUPPORTED_RESPONSE: &'static str = "HTTP/1.0 505 Version Not Supported\r\n\r\n";
 
 #[derive(Clone)]
 pub struct Proxy {
@@ -69,24 +73,23 @@ impl Proxy {
         }
     }
 
-    async fn handle(&self, stream: TcpStream, addr: SocketAddr) {
-        let addr_str = addr.to_string();
-        trace!("handling connection from {}", addr_str);
-
+    async fn handle(&self, c_stream: TcpStream, c_addr: SocketAddr) {
+        let c_addr_str = c_addr.to_string();
+        trace!("handling connection from {}", c_addr_str);
 
         // Wait for the stream to be readable
-        match stream.readable().await {
-            Err(_) => {
-                warn!("error awaiting readable stream");
+        match c_stream.readable().await {
+            Ok(_) => (),
+            Err(e) => {
+                warn!("error awaiting readable stream: {}", e);
                 return;
             },
-            _ => (),
         }
         // Read from the stream
         trace!("reading from the stream");
         #[allow(unused_mut)]
         let mut buffer = [0u8; BUFFER_SIZE];
-        let mut bytes_read = match tokio::time::timeout(Duration::from_millis(STREAM_READ_TIMEOUT), async { stream.try_read(&mut buffer) }).await {
+        let bytes_read = match tokio::time::timeout(Duration::from_millis(STREAM_READ_TIMEOUT), async { c_stream.try_read(&mut buffer) }).await {
             Ok(res) => match res {
                 Ok(size) => size,
                 Err(e) => {
@@ -103,27 +106,10 @@ impl Proxy {
         trace!("parsing data from the stream");
         #[allow(unused_variables)]
         #[allow(unused_assignments)]
-        /*
-        let (method, uri, version);
-        match parse_request(&buffer[..bytes_read]) {
-            Some((m, u, v)) => {
-                method = m;
-                uri = u;
-                version = v;
-            },
-            None => {
-                match stream.try_write(BAD_REQUEST.as_bytes()) {
-                    Ok(_) => (),
-                    Err(e) => warn!("error writing response to stream: {}", e),
-                }
-                return;
-            }
-        }
-        */
         let (method, uri, version) = match parse_request(&buffer[..bytes_read]) {
             Some(parts) => parts,
             None => {
-                match stream.try_write(BAD_REQUEST.as_bytes()) {
+                match c_stream.try_write(BAD_REQUEST_RESPONSE.as_bytes()) {
                     Ok(_) => (),
                     Err(e) => warn!("error writing response to stream: {}", e),
                 }
@@ -137,7 +123,7 @@ impl Proxy {
             Some(version) => match version {
                 (1, 0) | (1, 1) => (),
                 _ => {
-                    match stream.try_write(VERSION_NOT_SUPPORTED.as_bytes()) {
+                    match c_stream.try_write(VERSION_NOT_SUPPORTED_RESPONSE.as_bytes()) {
                         Ok(_) => (),
                         Err(e) => warn!("error writing response to stream: {}", e),
                     }
@@ -145,7 +131,7 @@ impl Proxy {
                 }
             },
             None => {
-                match stream.try_write(VERSION_NOT_SUPPORTED.as_bytes()) {
+                match c_stream.try_write(VERSION_NOT_SUPPORTED_RESPONSE.as_bytes()) {
                     Ok(_) => (),
                     Err(e) => warn!("error writing response to stream: {}", e),
                 }
@@ -157,7 +143,7 @@ impl Proxy {
         let server_conn = match self.get_path(uri.clone()) {
             Some(conn) => conn,
             None => {
-                match stream.try_write(NOT_FOUND.as_bytes()) {
+                match c_stream.try_write(NOT_FOUND_RESPONSE.as_bytes()) {
                     Ok(_) => (),
                     Err(e) => warn!("error writing response to stream: {}", e),
                 }
@@ -165,18 +151,118 @@ impl Proxy {
             },
         };
         // Connect to the requested server
-        let server_stream = match TcpStream::connect(server_conn.addr).await {
+        trace!("connecting to the requested server");
+        let s_stream = match TcpStream::connect(server_conn.addr).await {
             Ok(server) => server,
             Err(e) => {
                 // Log client and server stream information
                 warn!("error connecting to server: {}", e);
+                match c_stream.try_write(INTERNAL_SERVER_ERROR_RESPONSE.as_bytes()) {
+                    Ok(_) => (),
+                    Err(e) => warn!("error writing response to client stream: {}", e),
+                }
                 return;
             },
         };
-        
-        // Read the rest from the stream
-        if bytes_read == BUFFER_SIZE {
-            info!("more bytes in stream");
+        // Wait for the server stream to be writable
+        match s_stream.writable().await {
+            Ok(_) => (),
+            Err(e) => {
+                warn!("error awaiting writable server stream: {}", e);
+                match c_stream.try_write(INTERNAL_SERVER_ERROR_RESPONSE.as_bytes()) {
+                    Ok(_) => (),
+                    Err(e) => warn!("error writing response to client stream: {}", e),
+                }
+                return;
+            },
+        }
+        // Write the request from the server stream
+        trace!("writing to the server stream");
+        match s_stream.try_write(&buffer[..bytes_read]) {
+            Ok(_) => (),
+            Err(e) => {
+                warn!("error writing request to server stream: {}", e);
+                match c_stream.try_write(INTERNAL_SERVER_ERROR_RESPONSE.as_bytes()) {
+                    Ok(_) => (),
+                    Err(e) => warn!("error writing response to client stream: {}", e),
+                }
+                return;
+            },
+        }
+        // Split the streams
+        trace!("splitting the client and server streams");
+        let (mut c_read, mut c_write) = c_stream.into_split();
+        let (mut s_read, mut s_write) = s_stream.into_split();
+        // IDEA: Possibly use std::sync::mpsc to just cancel both handles when
+        // one sends a message
+
+        // Spawn handle to read from client and write to server
+        let (c_read_tx, c_read_rx) = oneshot::channel();
+        trace!("concurrently reading from/writing to the client and server");
+        let c_read_handle = tokio::spawn(async move {
+            let mut buffer = [0u8; BUFFER_SIZE];
+            loop {
+                match c_read.read(&mut buffer).await {
+                    Ok(size) => match s_write.write(&buffer[..size]).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            warn!("error writing to server stream: {}", e);
+                            break;
+                        },
+                    },
+                    Err(e) => {
+                        warn!("error reading from client stream: {}", e);
+                        break;
+                    }
+                }
+            }
+            let _ = c_read_tx.send(true);
+        });
+        // Spawn handle to read from server and write to client
+        let (s_read_tx, s_read_rx) = oneshot::channel();
+        let s_read_handle = tokio::spawn(async move {
+            let mut buffer = [0u8; BUFFER_SIZE];
+            loop {
+                match s_read.read(&mut buffer).await {
+                    Ok(size) => match c_write.write(&buffer[..size]).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            warn!("error writing to client stream: {}", e);
+                            break;
+                        },
+                    },
+                    Err(e) => {
+                        warn!("error reading from server stream: {}", e);
+                        break;
+                    },
+                }
+            }
+            let _ = s_read_tx.send(true);
+        });
+        // Wait for either handle to exit and cancel the other
+        tokio::select! {
+            _ = c_read_rx => {
+                trace!("client_read_handle done, canceling server_read_handle");
+                s_read_handle.abort();
+                match s_read_handle.await {
+                    Err(e) if !e.is_cancelled() => {
+                        warn!("error cancelling server_read_handle: {}", e);
+                        return;
+                    },
+                    _ => (),
+                }
+            }
+            _ = s_read_rx => {
+                trace!("server_read_handle done, cancelling client_read_handle");
+                c_read_handle.abort();
+                match c_read_handle.await {
+                    Err(e) if !e.is_cancelled() => {
+                        warn!("error cancelling client_read_handle: {}", e);
+                        return;
+                    },
+                    _ => (),
+                }
+            }
         }
     }
 
