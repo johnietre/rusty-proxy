@@ -2,4 +2,4 @@
 A reverse proxy in Rust
 
 # Running
-RUST_LOG=rust_proxy::proxy cargo run
+RUST_LOG=rusty_proxy::proxy cargo run
