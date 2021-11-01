@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
+    io::ErrorKind,
     net::{SocketAddr, ToSocketAddrs},
     sync::{Arc, RwLock},
     time::Duration,
@@ -87,26 +88,37 @@ impl Proxy {
 
         // Wait for the stream to be readable
         logm(Level::Trace, format!("awaiting readable client stream"));
-        match tokio::time::timeout(Duration::from_millis(STREAM_READ_TIMEOUT), c_stream.readable()).await {
+        match tokio::time::timeout(
+            Duration::from_millis(STREAM_READ_TIMEOUT),
+            c_stream.readable(),
+        )
+        .await
+        {
             Ok(res) => match res {
                 Ok(_) => (),
                 Err(e) => {
-                logm(Level::Warn, format!("error awaiting readable client stream: {}", e));
-                },
+                    logm(
+                        Level::Warn,
+                        format!("error awaiting readable client stream: {}", e),
+                    );
+                }
             },
             Err(_) => {
                 logm(Level::Trace, format!("client stream read timed out"));
                 return;
-            },
+            }
         }
         // Read from the stream
         let mut buffer = [0u8; BUFFER_SIZE];
         let bytes_read = match c_stream.try_read(&mut buffer) {
-                Ok(size) => size,
-                Err(e) => {
-                    logm(Level::Warn, format!("error reading from client stream: {}", e));
-                    return;
-                },
+            Ok(size) => size,
+            Err(e) => {
+                logm(
+                    Level::Warn,
+                    format!("error reading from client stream: {}", e),
+                );
+                return;
+            }
         };
         // Parse the input
         let (method, uri, version) = match parse_request(&buffer[..bytes_read]) {
@@ -114,12 +126,21 @@ impl Proxy {
             None => {
                 match c_stream.try_write(BAD_REQUEST_RESPONSE) {
                     Ok(_) => (),
-                    Err(e) => logm(Level::Warn, format!("error writing response to client stream: {}", e)),
+                    Err(e) => logm(
+                        Level::Warn,
+                        format!("error writing response to client stream: {}", e),
+                    ),
                 }
                 return;
             }
         };
-        logm(Level::Trace, format!("received a `{}` request for path `{}` with HTTP version `{}`", method, uri, version));
+        logm(
+            Level::Trace,
+            format!(
+                "received a `{}` request for path `{}` with HTTP version `{}`",
+                method, uri, version
+            ),
+        );
         // Check the version
         // Only handle HTTP major 1 and minor 0 and 1
         match parse_http_version(version) {
@@ -128,7 +149,10 @@ impl Proxy {
                 _ => {
                     match c_stream.try_write(VERSION_NOT_SUPPORTED_RESPONSE) {
                         Ok(_) => (),
-                        Err(e) => logm(Level::Warn, format!("error writing response to stream: {}", e)),
+                        Err(e) => logm(
+                            Level::Warn,
+                            format!("error writing response to stream: {}", e),
+                        ),
                     }
                     return;
                 }
@@ -136,7 +160,10 @@ impl Proxy {
             None => {
                 match c_stream.try_write(VERSION_NOT_SUPPORTED_RESPONSE) {
                     Ok(_) => (),
-                    Err(e) => logm(Level::Warn, format!("error writing response to client stream: {}", e)),
+                    Err(e) => logm(
+                        Level::Warn,
+                        format!("error writing response to client stream: {}", e),
+                    ),
                 }
                 return;
             }
@@ -146,29 +173,44 @@ impl Proxy {
             "/" => {
                 self.handle_home(c_stream, c_addr, logm);
                 return;
-            },
+            }
             "/favicon.ico" => {
                 self.handle_favicon(c_stream, c_addr, logm);
                 return;
-            },
+            }
             _ => (),
         }
         // Get the server conn for the given path
-        logm(Level::Trace, format!("getting the server conn for the path {}", uri));
+        logm(
+            Level::Trace,
+            format!("getting the server conn for the path {}", uri),
+        );
         let server_conn = match self.get_path(uri.clone()) {
             Some(conn) => conn,
             None => {
                 match c_stream.try_write(NOT_FOUND_RESPONSE) {
                     Ok(_) => (),
-                    Err(e) => logm(Level::Warn, format!("error writing response to client stream: {}", e)),
+                    Err(e) => logm(
+                        Level::Warn,
+                        format!("error writing response to client stream: {}", e),
+                    ),
                 }
                 return;
-            },
+            }
         };
         // Set the server address for logging
-        let (c_addr_clone, s_addr_clone) = (c_addr.to_string().clone(), server_conn.addr.clone());
+        let (c_addr_clone, s_addr_clone) = (
+            c_addr.to_string().clone(),
+            server_conn.addr.to_string().clone(),
+        );
         let logm = move |level, msg| {
-            log!(level, "client: {}, server: {}: {}", c_addr_clone, s_addr_clone, msg);
+            log!(
+                level,
+                "client: {}, server: {}: {}",
+                c_addr_clone,
+                s_addr_clone,
+                msg
+            );
         };
         // Connect to the requested server
         logm(Level::Trace, format!("connecting to the server"));
@@ -179,35 +221,50 @@ impl Proxy {
                 logm(Level::Warn, format!("error connecting to server: {}", e));
                 match c_stream.try_write(INTERNAL_SERVER_ERROR_RESPONSE) {
                     Ok(_) => (),
-                    Err(e) => logm(Level::Warn, format!("error writing response to client stream: {}", e)),
+                    Err(e) => logm(
+                        Level::Warn,
+                        format!("error writing response to client stream: {}", e),
+                    ),
                 }
                 return;
-            },
+            }
         };
         // Wait for the server stream to be writable
         match s_stream.writable().await {
             Ok(_) => (),
             Err(e) => {
-                logm(Level::Warn, format!("error awaiting writable server stream: {}", e));
+                logm(
+                    Level::Warn,
+                    format!("error awaiting writable server stream: {}", e),
+                );
                 match c_stream.try_write(INTERNAL_SERVER_ERROR_RESPONSE) {
                     Ok(_) => (),
-                    Err(e) => logm(Level::Warn, format!("error writing response to client stream: {}", e)),
+                    Err(e) => logm(
+                        Level::Warn,
+                        format!("error writing response to client stream: {}", e),
+                    ),
                 }
                 return;
-            },
+            }
         }
         // Write the request from the server stream
         logm(Level::Trace, format!("writing to the server stream"));
         match s_stream.try_write(&buffer[..bytes_read]) {
             Ok(_) => (),
             Err(e) => {
-                logm(Level::Warn, format!("error writing request to server stream: {}", e));
+                logm(
+                    Level::Warn,
+                    format!("error writing request to server stream: {}", e),
+                );
                 match c_stream.try_write(INTERNAL_SERVER_ERROR_RESPONSE) {
                     Ok(_) => (),
-                    Err(e) => logm(Level::Warn, format!("error writing response to client stream: {}", e)),
+                    Err(e) => logm(
+                        Level::Warn,
+                        format!("error writing response to client stream: {}", e),
+                    ),
                 }
                 return;
-            },
+            }
         }
         // Split the streams
         let (mut c_read, mut c_write) = c_stream.into_split();
@@ -216,7 +273,10 @@ impl Proxy {
         // one sends a message
 
         // Spawn handle to read from client and write to server
-        logm(Level::Trace, format!("concurrently reading from/writing to the client and server"));
+        logm(
+            Level::Trace,
+            format!("concurrently reading from/writing to the client and server"),
+        );
         // Spawn handle to read from client and write to server
         let logmc = logm.clone();
         let (c_read_tx, c_read_rx) = oneshot::channel();
@@ -227,16 +287,22 @@ impl Proxy {
                     Ok(0) => {
                         logmc(Level::Trace, format!("client stream closed"));
                         break;
-                    },
+                    }
                     Ok(size) => match s_write.write(&buffer[..size]).await {
                         Ok(_) => (),
                         Err(e) => {
-                            logmc(Level::Warn, format!("error writing to server stream: {}", e));
+                            logmc(
+                                Level::Warn,
+                                format!("error writing to server stream: {}", e),
+                            );
                             break;
-                        },
+                        }
                     },
                     Err(e) => {
-                        logmc(Level::Warn, format!("error reading from client stream: {}", e));
+                        logmc(
+                            Level::Warn,
+                            format!("error reading from client stream: {}", e),
+                        );
                         break;
                     }
                 }
@@ -253,18 +319,24 @@ impl Proxy {
                     Ok(0) => {
                         logms(Level::Trace, format!("server stream closed"));
                         break;
-                    },
+                    }
                     Ok(size) => match c_write.write(&buffer[..size]).await {
                         Ok(_) => (),
                         Err(e) => {
-                            logms(Level::Warn, format!("error writing to client stream: {}", e));
+                            logms(
+                                Level::Warn,
+                                format!("error writing to client stream: {}", e),
+                            );
                             break;
-                        },
+                        }
                     },
                     Err(e) => {
-                        logms(Level::Warn, format!("error reading from server stream: {}", e));
+                        logms(
+                            Level::Warn,
+                            format!("error reading from server stream: {}", e),
+                        );
                         break;
-                    },
+                    }
                 }
             }
             let _ = s_read_tx.send(true);
@@ -298,7 +370,11 @@ impl Proxy {
     }
 
     pub fn add_path(&self, server: ServerConn) -> Result<(), ProxyError> {
-        trace!("adding server to servers with addr {}://{}", server.scheme, server.addr);
+        trace!(
+            "adding server to servers with addr {}://{}",
+            server.scheme,
+            server.addr
+        );
         let servers = Arc::clone(&self.servers);
         let mut servers = servers.write().unwrap();
         if servers.values().any(|v| v.addr == server.addr) {
@@ -316,36 +392,74 @@ impl Proxy {
         servers.get(&path).cloned()
     }
 
-    pub fn get_addr(&self, addr: String) -> Option<ServerConn> {
+    #[allow(dead_code)]
+    pub fn get_addr(&self, addr: impl ToSocketAddrs) -> Option<ServerConn> {
+        let addr = match addr.to_socket_addrs() {
+            Ok(mut addrs) => addrs.next().unwrap(),
+            Err(_) => return None,
+        };
         let servers = Arc::clone(&self.servers);
         let servers = servers.read().unwrap();
         servers.values().find(|v| v.addr == addr).cloned()
     }
 
+    #[allow(dead_code)]
     pub fn remove_path(&self, path: String) {
         let servers = Arc::clone(&self.servers);
         let mut servers = servers.write().unwrap();
         servers.remove(&path);
     }
 
-    fn handle_home<L>(&self, c_stream: TcpStream, _: SocketAddr, logm: L) where L: Fn(log::Level, String) {
+    fn handle_home<L>(&self, c_stream: TcpStream, _: SocketAddr, logm: L)
+    where
+        L: Fn(log::Level, String),
+    {
         match c_stream.try_write(OK_RESPONSE) {
             Ok(_) => (),
-            Err(e) => logm(Level::Warn, format!("error writing response to client stream: {}", e)),
+            Err(e) => logm(
+                Level::Warn,
+                format!("error writing response to client stream: {}", e),
+            ),
         }
     }
 
-    fn handle_favicon<L>(&self, c_stream: TcpStream, _: SocketAddr, logm: L) where L: Fn(log::Level, String) {
+    fn handle_favicon<L>(&self, c_stream: TcpStream, _: SocketAddr, logm: L)
+    where
+        L: Fn(log::Level, String),
+    {
         match c_stream.try_write(NOT_FOUND_RESPONSE) {
             Ok(_) => (),
-            Err(e) => logm(Level::Warn, format!("error writing response to client stream: {}", e)),
+            Err(e) => logm(
+                Level::Warn,
+                format!("error writing response to client stream: {}", e),
+            ),
         }
     }
 
     async fn check_servers(&self) {
-        if 1 + 1 == 1 {
-            self.get_addr("127.0.0.1:8000".into());
-            self.remove_path("/remove".into());
+        loop {
+            tokio::time::sleep(Duration::new(5, 0)).await;
+            let servers = Arc::clone(&self.servers);
+            let servers_iter = { servers.read().unwrap().clone().into_iter() };
+            *servers.write().unwrap() = servers_iter
+                .filter_map(|(path, mut conn)| {
+                    // IDEA: Use connection timeout
+                    match std::net::TcpStream::connect(conn.addr.clone()) {
+                        Ok(_) => Some((path, conn)),
+                        Err(ref e) if e.kind() != ErrorKind::ConnectionRefused => {
+                            Some((path, conn))
+                        }
+                        Err(_) => {
+                            if conn.failed {
+                                None
+                            } else {
+                                conn.failed = true;
+                                Some((path, conn))
+                            }
+                        }
+                    }
+                })
+                .collect();
         }
     }
 }
@@ -353,18 +467,23 @@ impl Proxy {
 #[derive(Clone)]
 pub struct ServerConn {
     path: String,
-    // addr: SocketAddr
-    addr: String,
+    addr: SocketAddr,
     scheme: String,
+    failed: bool,
 }
 
 impl ServerConn {
-    pub fn new(path: String, addr: String, scheme: String) -> Self {
-        Self {
+    pub fn new(path: String, addr: impl ToSocketAddrs, scheme: String) -> Option<Self> {
+        let addr = match addr.to_socket_addrs() {
+            Ok(mut addrs) => addrs.next().unwrap(),
+            Err(_) => return None,
+        };
+        Some(Self {
             path,
-            addr,
             scheme,
-        }
+            addr,
+            failed: false,
+        })
     }
 }
 
@@ -381,7 +500,11 @@ fn parse_request(request: &[u8]) -> Option<(String, String, String)> {
     if parts.len() < 3 {
         return None;
     }
-    Some((parts[0].to_owned(), parts[1].to_owned(), parts[2..].join(" ").to_owned()))
+    Some((
+        parts[0].to_owned(),
+        parts[1].to_owned(),
+        parts[2..].join(" ").to_owned(),
+    ))
 }
 
 // Parses an HTTP version
@@ -406,7 +529,7 @@ fn parse_http_version(version: String) -> Option<(i32, i32)> {
         Ok(i) => major = i,
         Err(_) => return None,
     }
-    match String::from_utf8_lossy(&version[pos+1..]).parse::<i32>() {
+    match String::from_utf8_lossy(&version[pos + 1..]).parse::<i32>() {
         Ok(i) => minor = i,
         Err(_) => return None,
     }
