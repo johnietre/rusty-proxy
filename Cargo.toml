@@ -2,11 +2,16 @@
 name = "rusty-proxy"
 version = "0.1.0"
 authors = ["johnietre <johnietrebus@gmail.com>"]
-edition = "2018"
+edition = "2021"
+rust-version = "1.57"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 env_logger = "0.9.0"
+lazy_static = "1.4.0"
 log = "0.4.14"
+regex = "1.5"
+socket2 = { version = "0.4.4", features = ["all"] }
 tokio = { version = "1.12.0", features = ["full"] }
+tokio-rustls = "0.23.2"
