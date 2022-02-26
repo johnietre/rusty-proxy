@@ -1,21 +1,12 @@
-use tokio;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use env_logger;
 
 mod proxy;
 use proxy::Proxy;
 
+//async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut proxy = Proxy::new("127.0.0.1:8000")?;
-    let ln = TcpListener::bind("127.0.0.1:8000").await?;
-    let (mut s1, _) = ln.accept().await?;
-    let (mut s2, _) = ln.accept().await?;
-    println!(
-        "{:?}",
-        copy_bidirectional(&mut s1, &mut s2)
-            .await
-            .unwrap_or_default()
-    );
-    Ok(())
+async fn main() -> std::io::Result<()> {
+    env_logger::init();
+    let proxy = Proxy::new("127.0.0.1:8000")?;
+    proxy.run().await
 }

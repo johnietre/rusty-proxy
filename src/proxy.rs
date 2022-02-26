@@ -1,38 +1,54 @@
 #![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+use lazy_static::lazy_static;
 use log::{log, Level};
-use regex::bytes::Regex;
+use regex::bytes::Regex; // TODO: Possibly use regular str version
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io;
+use std::marker::Unpin;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use std::time::Duration;
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
+    WriteHalf,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const REQUEST_BUFFER_SIZE: usize = 1 << 10;
+const STREAM_READ_TIMEOUT: u64 = 10_000; // In ms
+const BAD_REQUEST_RESPONSE: &'static [u8] = b"HTTP/1.1 400 400 Bad Request\r\n\r\n";
+const NOT_FOUND_RESPONSE: &'static [u8] = b"HTTP/1.1 404 Not Found\r\n\r\n";
+const INTERNAL_SERVER_ERROR_RESPONSE: &'static [u8] = b"HTTP/1.1 500 Internal Server Error\r\n\r\n";
 
 lazy_static! {
     static ref REQ_RE: Regex = Regex::new(r"^\w+ /([^/ ]+)?(/.+)? HTTP").unwrap();
 }
 
+trait IOUnpin: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl IOUnpin for TcpStream {}
+impl IOUnpin for tokio_rustls::server::TlsStream<TcpStream> {}
+
 #[derive(Clone)]
 pub struct Proxy {
-    //acceptor: TlsAcceptor,
     acceptor: Option<TlsAcceptor>,
+    connector: Option<TlsConnector>,
     addr: SocketAddr,
-    servers: Arc<HashMap<String, ServerInfo>>,
+    server_info_map: Arc<HashMap<String, ServerInfo>>,
     shutdown: Arc<AtomicBool>,
     force_shutdown: Arc<AtomicBool>,
     status: Arc<ProxyStatus>,
     num_running: Arc<AtomicU32>,
-    server_info_map: Arc<HashMap<String, ServerInfo>>,
     tunnel_reqs: Arc<AtomicU32>,
-    reserved_paths: Arc<HashMap<String, Box<dyn Fn()>>>,
+    //reserved_paths: Arc<HashMap<String, Box<dyn Fn()>>>,
 }
 
 impl Proxy {
@@ -42,94 +58,232 @@ impl Proxy {
             .next()
             .ok_or_else(|| io::Error::from(io::ErrorKind::AddrNotAvailable))?;
         Ok(Self {
-            //acceptor: TlsAcceptor::from(Arc::new(rustls::ServerConfig::builder().with_safe_defaults().with_no_client_auth())),
             acceptor: None,
+            connector: None,
             addr: addr,
-            servers: Arc::new(HashMap::new()),
+            //server_info_map: Arc::new(HashMap::new()),
+            server_info_map: {
+                let mut m = HashMap::new();
+                let server = ServerInfo::new("server1", "127.0.0.1:9000");
+                m.insert(server.name.clone(), server);
+                let server = ServerInfo::new("server2", "127.0.0.1:9001");
+                m.insert(server.name.clone(), server);
+                let server = ServerInfo::new("server3", "127.0.0.1:9002");
+                m.insert(server.name.clone(), server);
+                let server = ServerInfo::new("server4", "127.0.0.1:9003");
+                m.insert(server.name.clone(), server);
+                Arc::new(m)
+            },
             shutdown: Arc::new(AtomicBool::new(false)),
             force_shutdown: Arc::new(AtomicBool::new(false)),
             status: Arc::new(ProxyStatus::NotStarted),
             num_running: Arc::new(AtomicU32::new(0)),
-            server_info_map: Arc::new(HashMap::new()),
             tunnel_reqs: Arc::new(AtomicU32::new(0)),
-            reserved_paths: Arc::new(HashMap::new()),
+            //reserved_paths: Arc::new(HashMap::new()),
         })
     }
 
     pub async fn run(&self) -> io::Result<()> {
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_reuse_port(true)?;
-        //let addr = self.addr.clone().into();
-        //socket.bind(&addr)?;
+        let addr = self.addr.clone().into();
+        socket.bind(&addr)?;
+        socket.listen(128)?;
         // TODO: Possibly use socket.listen function
         socket.set_nonblocking(true)?;
         let ln = TcpListener::from_std(socket.into())?;
+        log!(Level::Trace, "listening on {}", addr.as_socket().unwrap());
         loop {
             // TODO: Poll accept while watching proxy status; possibly use oneshot channel
             match ln.accept().await {
-                /*
-                Ok((conn, addr)) => tokio::spawn(async move {
-                    self.accept(conn, addr),
-                });
-                // */
-                Ok(_) => (),
-                Err(err) => eprintln!("{}", err), // TODO: Handle different errors
+                Ok((conn, addr)) => {
+                    let px = self.clone();
+                    tokio::spawn(async move {
+                        px.accept(conn, addr).await;
+                    });
+                }
+                Err(err) => {
+                    eprintln!("{}", err); // TODO: Handle different errors
+                    break Err(err)
+                }
             }
         }
-        println!("running");
-        Ok(())
     }
 
-    fn accept(self, conn: TcpStream, addr: SocketAddr) {
+    async fn accept(self, client: TcpStream, addr: SocketAddr) {
         if let Some(acceptor) = self.acceptor.as_ref() {
-            let mut stream = acceptor.accept(conn);
-            self.handle();
+            // TODO: Possibly send 426 upgrade response on error
+            match acceptor.accept(client).await {
+                Ok(client) => self.handle(client, addr).await,
+                Err(e) => eprintln!("error accepting client TLS: {}", e), // TODO: Handle error better
+            }
         } else {
-            self.handle();
+            self.handle(client, addr).await;
         }
     }
 
-    fn handle<S: AsyncRead + AsyncWrite>(self, mut client: S, client_addr: SocketAddr) {
+    async fn handle<S>(self, client: S, client_addr: SocketAddr)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         // TODO: Create log function
         let client_addr_clone = client_addr.clone();
         let logm = |level, msg| {
             log!(level, "client: {}, server: N/A: {}", client_addr_clone, msg);
         };
-        let mut req_buf = [0u8; REQUEST_BUFFER_SIZE];
+        let (client_read, mut client_write) = tokio::io::split(client);
+        //let mut req_buf = [0u8; REQUEST_BUFFER_SIZE];
+        let mut client_reader = BufReader::with_capacity(REQUEST_BUFFER_SIZE, client_read);
         // Read from the stream with the timeout
+        let mut first_line_buf = Vec::new();
         let bytes_read = match tokio::time::timeout(
             Duration::from_millis(STREAM_READ_TIMEOUT),
-            client.read(&mut req_buf),
-        ) {
+            client_reader.read_until(b'\n', &mut first_line_buf),
+            //client.read(&mut req_buf),
+        )
+        .await
+        {
             Ok(res) => match res {
+                #[allow(unused_must_use)] // Used for the write below
                 Ok(l) if l < 2 => {
-                    #[allow(unused_must_use)]
-                    {
-                        client.write(BAD_REQUEST_RESPONSE).await;
-                    }
+                    client_write.write(BAD_REQUEST_RESPONSE).await;
                     return;
                 }
                 Ok(l) => l,
                 Err(e) => {
-                    // TODO: Log
-                    eprintln!("error reading from client stream: {}", e);
+                    logm(
+                        Level::Info,
+                        format!("error reading from client stream: {}", e),
+                    );
                     return;
                 }
             },
-            Err(e) => {
-                // TODO: Log
-                eprintln!("client stream read timed out");
+            Err(_) => {
+                logm(Level::Trace, String::from("client stream read timed out"));
                 return;
             }
         };
         // Check if the request is a special request
-        match ReqHeader::from(&req_buf[..2]) {
+        match ReqHeader::from(&first_line_buf[..2]) {
             ReqHeader::Tunnel => (),  // TODO: Handle tunnel
             ReqHeader::Command => (), // TODO: Handle command
             ReqHeader::Unknown => (),
         }
-        let req = &req_buf[..bytes_read];
-        // TODO: Use REQ_RE to parse first line of request
+        //let req = req_buf[..bytes_read];
+        let req = first_line_buf.as_slice();
+        let site_name = match REQ_RE.captures(req) {
+            Some(caps) => match String::from_utf8(caps[1].to_vec()) {
+                Ok(name) => name,
+                #[allow(unused_must_use)] // Used for the write below
+                Err(_) => {
+                    client_write.write(BAD_REQUEST_RESPONSE).await;
+                    return;
+                }
+            },
+            #[allow(unused_must_use)] // Used for the write below
+            None => {
+                client_write.write(BAD_REQUEST_RESPONSE).await;
+                return;
+            }
+        };
+        // Check if the site is reserved
+        match site_name.as_str() {
+            "" => (),            // TODO: Handle home
+            "favicon.ico" => (), // TODO: Handle favicon
+            _ => (),
+        }
+        // Remove the site name from the request URI
+        // TODO: Find better way to do this
+        let req_str = String::from_utf8(req.to_vec()).unwrap();
+        let index = req_str.find('/').unwrap() + site_name.len() + 1;
+        let req_str = if req_str.get(index..index).unwrap() == "/" {
+            req_str.replacen(&(site_name.clone() + "/"), "", 1)
+        } else {
+            req_str.replacen(&site_name, "", 1)
+        };
+        let header = format!("\r\nForwarded: for={}\r\n", client_addr.ip());
+        // Don't have to use replacen since the req only goes to the first '\n'
+        let req_str = req_str.replacen("\r\n", &header, 1);
+        // TODO: Switch to sync map methods
+        // Get the server info
+        let server_info = if let Some(info) = self.server_info_map.get(&site_name).clone() {
+            info
+        } else {
+            #[allow(unused_must_use)]
+            {
+                client_write.write(NOT_FOUND_RESPONSE).await;
+            }
+            return;
+        };
+        let server_addr_clone = server_info.addr.clone();
+        let logm = |level, msg| {
+            log!(
+                level,
+                "client: {}, server: {}: {}",
+                client_addr_clone,
+                server_addr_clone,
+                msg
+            );
+        };
+        if server_info.tunnel {
+            // TODO
+            return;
+        }
+        // Connect to the server
+        let server_stream = match TcpStream::connect(&server_info.addr).await {
+            Ok(stream) => stream,
+            #[allow(unused_must_use)]
+            Err(e) => {
+                client_write.write(INTERNAL_SERVER_ERROR_RESPONSE).await;
+                return;
+            }
+        };
+        let mut server_stream: Box<dyn IOUnpin> = if server_info.secure {
+            // TODO:
+            if let Some(connector) = self.connector.clone() {
+                // TODO: Connect
+                Box::new(server_stream)
+            } else {
+                // TODO: Log error (error is that there needs to be a client connector
+                return;
+            }
+        } else {
+            Box::new(server_stream)
+        };
+        // TODO: Do better
+        // Write the request to the server
+        match server_stream.write(req_str.as_bytes()).await {
+            Ok(_) => (),
+            #[allow(unused_must_use)]
+            Err(e) => {
+                logm(
+                    Level::Info,
+                    format!("error writing request to server: {}", e),
+                );
+                client_write.write(INTERNAL_SERVER_ERROR_RESPONSE).await;
+                return;
+            }
+        }
+        match server_stream.write(client_reader.buffer()).await {
+            Ok(_) => (),
+            #[allow(unused_must_use)]
+            Err(e) => {
+                logm(
+                    Level::Info,
+                    format!("error writing request to server: {}", e),
+                );
+                client_write.write(INTERNAL_SERVER_ERROR_RESPONSE).await;
+                return;
+            }
+        }
+        let mut client_stream = client_reader.into_inner().unsplit(client_write);
+        match tokio::io::copy_bidirectional(&mut client_stream, server_stream.as_mut()).await {
+            Ok(_) => (),
+            Err(e) => {
+                // TODO: Do more (better)?better
+                logm(Level::Info, format!("error copying between streams: {}", e));
+            }
+        }
     }
 
     async fn pipe_conns<T, U>(&self, reader: ReadHalf<T>, writer: WriteHalf<U>) {
@@ -147,6 +301,17 @@ struct ServerInfo {
     addr: String,
     tunnel: bool,
     secure: bool,
+}
+
+impl ServerInfo {
+    fn new<S: ToString>(name: S, addr: S) -> Self {
+        Self {
+            name: name.to_string(),
+            addr: addr.to_string(),
+            tunnel: false,
+            secure: false,
+        }
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -206,10 +371,10 @@ impl From<u16> for ReqHeader {
             match u as u16 {
                 Self::Command => Self::Command,
                 Self::Tunnel => Self::Tunnel,
-                Self::Unknown => Self::Unknown,
+                Self::Unknown => Self::Unknown
             }
         }
-        .unwrap_or(Self::Uknown)
+        .unwrap_or(Self::Unknown)
     }
 }
 

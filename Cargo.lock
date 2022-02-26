@@ -293,9 +293,11 @@ dependencies = [
 name = "rusty-proxy"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "env_logger",
- "libc",
+ "lazy_static",
  "log",
+ "regex",
  "socket2",
  "tokio",
  "tokio-rustls",
