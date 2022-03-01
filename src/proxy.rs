@@ -1,3 +1,13 @@
+// TODO: Create pipe_conns function
+// Can't use `copy_bidirectional` because the client will send multiple
+// requests over a single socket and they may not get routed to the proper
+// place
+// TODO: Also create parse_requset function that parses and reformats a request
+// that takes an optional server name, checking if the request is asking for
+// the same server, if not, connecting to the new server
+// TODO: Requests with no server name (i.e., no path) cause a thread panic from
+// regex becuase there is no group index at 1
+// TODO: Take logm closures in all "serve_" functions
 #![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
@@ -5,7 +15,6 @@ use lazy_static::lazy_static;
 use log::{log, Level};
 use regex::bytes::Regex; // TODO: Possibly use regular str version
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
 use std::io;
 use std::marker::Unpin;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -21,6 +30,8 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+use rusty_proxy::sync_map::SyncMap;
 
 const REQUEST_BUFFER_SIZE: usize = 1 << 10;
 const STREAM_READ_TIMEOUT: u64 = 10_000; // In ms
@@ -42,12 +53,13 @@ pub struct Proxy {
     acceptor: Option<TlsAcceptor>,
     connector: Option<TlsConnector>,
     addr: SocketAddr,
-    server_info_map: Arc<HashMap<String, ServerInfo>>,
+    server_info_map: SyncMap<ServerInfo>,
     shutdown: Arc<AtomicBool>,
     force_shutdown: Arc<AtomicBool>,
     status: Arc<ProxyStatus>,
     num_running: Arc<AtomicU32>,
     tunnel_reqs: Arc<AtomicU32>,
+    command_password: Arc<String>,
     //reserved_paths: Arc<HashMap<String, Box<dyn Fn()>>>,
 }
 
@@ -61,24 +73,24 @@ impl Proxy {
             acceptor: None,
             connector: None,
             addr: addr,
-            //server_info_map: Arc::new(HashMap::new()),
             server_info_map: {
-                let mut m = HashMap::new();
+                let m = SyncMap::new();
                 let server = ServerInfo::new("server1", "127.0.0.1:9000");
-                m.insert(server.name.clone(), server);
+                m.store(server.name.clone(), server);
                 let server = ServerInfo::new("server2", "127.0.0.1:9001");
-                m.insert(server.name.clone(), server);
+                m.store(server.name.clone(), server);
                 let server = ServerInfo::new("server3", "127.0.0.1:9002");
-                m.insert(server.name.clone(), server);
+                m.store(server.name.clone(), server);
                 let server = ServerInfo::new("server4", "127.0.0.1:9003");
-                m.insert(server.name.clone(), server);
-                Arc::new(m)
+                m.store(server.name.clone(), server);
+                m
             },
             shutdown: Arc::new(AtomicBool::new(false)),
             force_shutdown: Arc::new(AtomicBool::new(false)),
             status: Arc::new(ProxyStatus::NotStarted),
             num_running: Arc::new(AtomicU32::new(0)),
             tunnel_reqs: Arc::new(AtomicU32::new(0)),
+            command_password: Arc::new(String::new()),
             //reserved_paths: Arc::new(HashMap::new()),
         })
     }
@@ -103,8 +115,9 @@ impl Proxy {
                     });
                 }
                 Err(err) => {
-                    eprintln!("{}", err); // TODO: Handle different errors
-                    break Err(err)
+                    // TODO: Handle different errors
+                    //error!("error accepting connection: {}", err);
+                    break Err(err);
                 }
             }
         }
@@ -122,10 +135,7 @@ impl Proxy {
         }
     }
 
-    async fn handle<S>(self, client: S, client_addr: SocketAddr)
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
+    async fn handle<S: IOUnpin>(self, client: S, client_addr: SocketAddr) {
         // TODO: Create log function
         let client_addr_clone = client_addr.clone();
         let logm = |level, msg| {
@@ -188,8 +198,18 @@ impl Proxy {
         };
         // Check if the site is reserved
         match site_name.as_str() {
-            "" => (),            // TODO: Handle home
-            "favicon.ico" => (), // TODO: Handle favicon
+            "" => {
+                let client_read = client_reader.into_inner();
+                self.serve_home(client_read.unsplit(client_write), req)
+                    .await;
+                return;
+            }
+            "favicon.ico" => {
+                let client_read = client_reader.into_inner();
+                self.serve_favicon(client_read.unsplit(client_write), req)
+                    .await;
+                return;
+            }
             _ => (),
         }
         // Remove the site name from the request URI
@@ -206,7 +226,7 @@ impl Proxy {
         let req_str = req_str.replacen("\r\n", &header, 1);
         // TODO: Switch to sync map methods
         // Get the server info
-        let server_info = if let Some(info) = self.server_info_map.get(&site_name).clone() {
+        let server_info = if let Some(info) = self.server_info_map.load(&site_name) {
             info
         } else {
             #[allow(unused_must_use)]
@@ -286,10 +306,28 @@ impl Proxy {
         }
     }
 
-    async fn pipe_conns<T, U>(&self, reader: ReadHalf<T>, writer: WriteHalf<U>) {
-        //
+    //async pipe_conns
+
+    async fn serve_home<S: IOUnpin>(&self, mut client: S, req: &[u8]) {
+        // TODO
     }
 
+    #[allow(unused_must_use)]
+    async fn serve_favicon<S: IOUnpin>(&self, mut client: S, _: &[u8]) {
+        // TODO: Possibly handle error
+        client.write(NOT_FOUND_RESPONSE).await;
+    }
+
+    async fn serve_tunnel<S: IOUnpin>(&self, mut clinet: S, req: &[u8]) {
+        // TODO
+    }
+
+    // Expects request without 2 byte header
+    async fn serve_command<S: IOUnpin>(&self, mut clinet: S, req: &[u8]) {
+        // TODO
+    }
+
+    // Expects request without 2 byte header
     fn shutdown(&self) {}
 
     fn force_shutdown(&self) {}
