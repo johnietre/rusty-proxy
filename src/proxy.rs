@@ -75,14 +75,6 @@ impl Proxy {
             addr: addr,
             server_info_map: {
                 let m = SyncMap::new();
-                let server = ServerInfo::new("server1", "127.0.0.1:9000");
-                m.store(server.name.clone(), server);
-                let server = ServerInfo::new("server2", "127.0.0.1:9001");
-                m.store(server.name.clone(), server);
-                let server = ServerInfo::new("server3", "127.0.0.1:9002");
-                m.store(server.name.clone(), server);
-                let server = ServerInfo::new("server4", "127.0.0.1:9003");
-                m.store(server.name.clone(), server);
                 m
             },
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -557,12 +549,13 @@ impl Proxy {
         }
         if let Some(part) = parts.next() {
             if part.len() == 0 {
-                return Err(BAD_REQUEST_RESPONSE);
+                Err(BAD_REQUEST_RESPONSE)
             } else if part.len() == 1 {
-                return Ok((String::from(""), first_line));
+                Ok((String::from(""), first_line))
             } else {
-                if let Some(pos) = part.iter().position(|&b| b == b'/' || b == b' ') {
-                    match String::from_utf8(part[1..pos].to_vec()) {
+                /*
+                if let Some(pos) = part[1..].iter().position(|&b| b == b'/' || b == b' ') {
+                    match String::from_utf8(part[1..pos + 1].to_vec()) {
                         Ok(name) => {
                             if part[pos] == b'/' {
                                 Ok((name.clone(), first_line.replacen(&(name + "/"), "", 1)))
@@ -570,14 +563,30 @@ impl Proxy {
                                 Ok((name.clone(), first_line.replacen(&name, "", 1)))
                             }
                         }
-                        Err(_) => Err(BAD_REQUEST_RESPONSE),
+                        //Err(_) => Err(BAD_REQUEST_RESPONSE),
+                        Err(e) => {
+                            log!(Level::Trace, "erroro parsing site: {}", e);
+                            Err(BAD_REQUEST_RESPONSE)
+                        }
                     }
                 } else {
                     return Err(BAD_REQUEST_RESPONSE);
                 }
+                */
+                let pos = part[1..].iter().position(|&b| b == b'/').unwrap_or(part.len() - 1);
+                match String::from_utf8(part[1..pos + 1].to_vec()) {
+                    Ok(name) => {
+                        if part[pos] == b'/' {
+                            Ok((name.clone(), first_line.replacen(&(name + "/"), "", 1)))
+                        } else {
+                            Ok((name.clone(), first_line.replacen(&name, "", 1)))
+                        }
+                    }
+                    Err(_) => Err(BAD_REQUEST_RESPONSE),
+                }
             }
         } else {
-            return Err(BAD_REQUEST_RESPONSE);
+            Err(BAD_REQUEST_RESPONSE)
         }
         /*
         match REQ_RE.captures(req) {
