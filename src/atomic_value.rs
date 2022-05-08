@@ -1,5 +1,6 @@
 // A basic (and bad) implementation of Go's atomic.Value
 // TODO: Do Orderings
+// TODO: Possibly look at jon gjengset's video on a generic atomic
 use std::sync::{
     atomic::{AtomicPtr, Ordering},
     Arc,
